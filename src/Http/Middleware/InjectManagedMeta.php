@@ -28,8 +28,14 @@ class InjectManagedMeta
 {
     public function handle(Request $request, Closure $next): Response
     {
-        // Managed redirects first — cheap indexed lookup.
-        $redirect = $this->matchRedirect($request);
+        // Managed redirects first — cheap indexed lookup. A bad row
+        // (empty target, non-redirect code) must NEVER 500 the page.
+        try {
+            $redirect = $this->matchRedirect($request);
+        } catch (\Throwable $e) {
+            report($e);
+            $redirect = null;
+        }
         if ($redirect) {
             return redirect($redirect['to'], $redirect['code']);
         }
@@ -58,11 +64,28 @@ class InjectManagedMeta
         if (!$row) {
             return null;
         }
-        $to = (string) $row->to_path;
+        $to = trim((string) $row->to_path);
+        $code = (int) $row->code;
+        // Rows written before validation (or by hand) can carry an empty
+        // target or a non-redirect status — redirect() would throw → 500.
+        if ($to === '' || !in_array($code, [301, 302, 303, 307, 308], true)) {
+            return null;
+        }
         if (!preg_match('#^https?://#i', $to) && str_starts_with($to, '/')) {
             $to = $request->getSchemeAndHttpHost() . $to;
         }
-        return ['to' => $to, 'code' => (int) $row->code];
+        // Self-redirect loops: same path AND same host (punycode-aware —
+        // a /lenses → https://солярис.рф/lenses row would loop forever).
+        $toHost = (string) (parse_url($to, PHP_URL_HOST) ?: '');
+        $reqHost = $request->getHttpHost();
+        $sameHost = $toHost === ''
+            || strcasecmp($toHost, $reqHost) === 0
+            || (function_exists('idn_to_ascii')
+                && strcasecmp((string) (idn_to_ascii($toHost, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46) ?: $toHost), $reqHost) === 0);
+        if ($sameHost && SeoStore::normalizePath($to) === $path) {
+            return null;
+        }
+        return ['to' => $to, 'code' => $code];
     }
 
     private function shouldInject(Request $request, Response $response): bool
@@ -166,10 +189,6 @@ class InjectManagedMeta
             }
         }
 
-        if (!$tags) {
-            return;
-        }
-
         // Strip pre-existing template tags for keys we emit so the rendered
         // HTML never carries two <title> or conflicting <link rel="canonical">
         // tags (crawlers ignore duplicated canonicals and read the first title).
@@ -203,7 +222,30 @@ class InjectManagedMeta
             );
         }
 
-        $block = "<!-- GEO Engine managed meta -->\n" . implode("\n", $tags) . "\n<!-- /GEO Engine -->\n";
-        $response->setContent($head . $block . $tail);
+        if ($tags) {
+            $block = "<!-- GEO Engine managed meta -->\n" . implode("\n", $tags) . "\n<!-- /GEO Engine -->\n";
+            $content = $head . $block . $tail;
+        }
+
+        // inject_content_block: a stored HTML fragment rendered into the body
+        // (AI-GEO citability answers). Default anchor is right after the first
+        // <h1>; fall back to </body> when the page has no h1.
+        $extra = is_array($row->extra) ? $row->extra : [];
+        $contentBlock = is_string($extra['content_block'] ?? null) ? trim($extra['content_block']) : '';
+        if ($contentBlock !== '') {
+            $position = (string) ($extra['content_block_position'] ?? 'after_h1');
+            $wrapped = "\n<!-- GEO Engine content block -->\n" . $contentBlock . "\n<!-- /GEO Engine content block -->\n";
+            if ($position === 'before_body' && stripos($content, '</body>') !== false) {
+                $content = (string) preg_replace('#</body>#i', $wrapped . '</body>', $content, 1);
+            } elseif ($position === 'prepend_body' && preg_match('#<body[^>]*>#i', $content)) {
+                $content = (string) preg_replace('#(<body[^>]*>)#i', '$1' . $wrapped, $content, 1);
+            } elseif (preg_match('#</h1>#i', $content)) {
+                $content = (string) preg_replace('#</h1>#i', '</h1>' . $wrapped, $content, 1);
+            } elseif (stripos($content, '</body>') !== false) {
+                $content = (string) preg_replace('#</body>#i', $wrapped . '</body>', $content, 1);
+            }
+        }
+
+        $response->setContent($content);
     }
 }
